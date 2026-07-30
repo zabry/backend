@@ -1,0 +1,240 @@
+# frozen_string_literal: true
+
+require 'lite_spec_helper'
+
+MODELS = File.join(File.dirname(__FILE__), 'support/models')
+$LOAD_PATH.unshift(MODELS)
+
+require 'action_controller'
+require 'rspec/retry'
+
+if SpecConfig.instance.client_debug?
+  Mongoid.logger.level = Logger::DEBUG
+  Mongo::Logger.logger.level = Logger::DEBUG
+else
+  Mongoid.logger.level = Logger::INFO
+  Mongo::Logger.logger.level = Logger::INFO
+end
+
+# When testing locally we use the database named mongoid_test. However when
+# tests are running in parallel in a CI environment we need to use different
+# database names for each process running since we do not have transactions
+# and want a clean slate before each spec run.
+def database_id
+  'mongoid_test'
+end
+
+def database_id_alt
+  'mongoid_test_alt'
+end
+
+# Helper for dynamically creating a new one-off document class, without having to
+# create a new constant. This helps avoid namespace pollution in specs and
+# the need to awkwardly remove constants in an after block.
+#
+# Example:
+#   let(:model_class) do
+#     test_model do
+#       field :name, type: String
+#     end
+#   end
+#
+#   let(:model) { model_class.new(name: 'Test') }
+#
+def test_model(name: 'TestModel', &block)
+  Class.new.tap do |klass|
+    klass.define_singleton_method(:name) { name.to_s }
+    klass.include Mongoid::Document
+    klass.class_eval(&block) if block_given?
+  end
+end
+
+begin
+  require 'mrss/cluster_config'
+  require 'support/client_registry'
+  require 'mrss/constraints'
+  require 'mrss/event_subscriber'
+rescue LoadError => e
+  raise LoadError.new <<~MSG.strip
+    The test suite requires shared tooling to be installed.
+    Please refer to spec/README.md for instructions.
+    #{e.class}: #{e}
+  MSG
+end
+
+ClusterConfig = Mrss::ClusterConfig
+
+require 'support/authorization'
+require 'support/expectations'
+require 'support/helpers'
+require 'support/macros'
+require 'support/constraints'
+require 'support/crypt'
+
+use_ssl = %w[ ssl 1 true ].include?(ENV.fetch('SSL', nil))
+ssl_options = { ssl: use_ssl }.freeze
+
+# Give MongoDB servers time to start up in CI environments
+if SpecConfig.instance.ci?
+  starting = true
+  client = Mongo::Client.new(SpecConfig.instance.addresses, ssl_options)
+  while starting
+    begin
+      client.command(ping: 1)
+      break
+    rescue Mongo::Error::OperationFailure
+      sleep(2)
+      client.cluster.scan!
+    end
+  end
+end
+
+CONFIG = {
+  clients: {
+    default: {
+      database: database_id,
+      hosts: SpecConfig.instance.addresses,
+      options: ssl_options.merge(
+        server_selection_timeout: 3.42,
+        wait_queue_timeout: 1,
+        max_pool_size: 5,
+        heartbeat_frequency: 180,
+        user: SpecConfig.instance.uri.client_options[:user] || MONGOID_ROOT_USER.name,
+        password: SpecConfig.instance.uri.client_options[:password] || MONGOID_ROOT_USER.password,
+        auth_source: Mongo::Database::ADMIN
+      )
+    }
+  },
+  options: {
+    belongs_to_required_by_default: false,
+    log_level: if SpecConfig.instance.client_debug?
+                 :debug
+               else
+                 :info
+               end
+  }
+}
+
+if SpecConfig.instance.uri.uri_options[:load_balanced]
+  # If the URI specifies load balancing, we need to set the load_balanced option
+  # in the client configuration.
+  CONFIG[:clients][:default][:options][:load_balanced] = true
+  CONFIG[:clients][:default][:options][:connect] = :load_balanced
+end
+
+# Set the database that the spec suite connects to.
+Mongoid.configure do |config|
+  config.load_configuration(CONFIG)
+end
+
+# Autoload every model for the test suite that sits in spec/support/models.
+Dir[File.join(MODELS, '*.rb')].sort.each do |file|
+  name = File.basename(file, '.rb')
+  autoload name.camelize.to_sym, name
+end
+
+module Mongoid
+  class Query
+    include Mongoid::Criteria::Queryable
+  end
+end
+
+ActiveSupport::Inflector.inflections do |inflect|
+  inflect.irregular('canvas', 'canvases')
+  inflect.singular('address_components', 'address_component')
+end
+
+Time.zone = 'UTC'
+
+I18n.config.enforce_available_locales = false
+
+require 'i18n/backend/fallbacks' if %w[yes true 1].include?((ENV['TEST_I18N_FALLBACKS'] || '').downcase)
+
+unless SpecConfig.instance.atlas?
+  uri_options = SpecConfig.instance.uri.uri_options.merge(server_selection_timeout: 3.03)
+  uri_options[:connect] = :load_balanced if uri_options[:load_balanced]
+
+  # The user must be created before any of the tests are loaded, until
+  # https://jira.mongodb.org/browse/MONGOID-4827 is implemented.
+  client = Mongo::Client.new(SpecConfig.instance.addresses, uri_options)
+  begin
+    # Create the root user administrator as the first user to be added to the
+    # database. This user will need to be authenticated in order to add any
+    # more users to any other databases.
+    client.database.users.create(MONGOID_ROOT_USER)
+  rescue Mongo::Error::OperationFailure
+  ensure
+    client.close
+  end
+end
+
+RSpec.configure do |config|
+  config.raise_errors_for_deprecations!
+  config.include(Helpers)
+  config.include(Mongoid::Expectations)
+  config.extend(Mrss::Constraints)
+  config.extend(Constraints)
+  config.extend(Mongoid::Macros)
+
+  config.before(:suite) do
+    Mongoid.purge!
+  end
+
+  # Drop all collections and clear the identity map before each spec.
+  config.before do
+    cluster = Mongoid.default_client.cluster
+    Mongoid.default_client.reconnect if cluster.load_balanced? || !cluster.connected?
+
+    Mongoid.default_client.collections.each(&:drop)
+  end
+end
+
+# A subscriber to be used with the Ruby driver for testing.
+class EventSubscriber
+  # The started events.
+  attr_reader :started_events
+
+  # The succeeded events.
+  attr_reader :succeeded_events
+
+  # The failed events.
+  attr_reader :failed_events
+
+  # Create the test event subscriber.
+  #
+  # @example Create the subscriber
+  #   EventSubscriber.new
+  def initialize
+    @started_events = []
+    @succeeded_events = []
+    @failed_events = []
+  end
+
+  # Cache the succeeded event.
+  #
+  # @param [ Event ] event The event.
+  def succeeded(event)
+    @succeeded_events.push(event)
+  end
+
+  # Cache the started event.
+  #
+  # @param [ Event ] event The event.
+  def started(event)
+    @started_events.push(event)
+  end
+
+  # Cache the failed event.
+  #
+  # @param [ Event ] event The event.
+  def failed(event)
+    @failed_events.push(event)
+  end
+
+  # Clear all cached events.
+  def clear_events!
+    @started_events = []
+    @succeeded_events = []
+    @failed_events = []
+  end
+end

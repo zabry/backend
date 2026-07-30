@@ -1,0 +1,1542 @@
+# frozen_string_literal: true
+
+require 'spec_helper'
+require_relative 'includable_spec_models'
+
+describe Mongoid::Criteria::Includable do
+  shared_examples_for 'eager loading' do |method_name|
+    let!(:person) do
+      Person.create!(age: 1)
+    end
+
+    context 'when providing a name that is not a relation' do
+      let(:expected_error) do
+        (method_name == :eager_load) ? ArgumentError : Mongoid::Errors::InvalidIncludes
+      end
+
+      it 'raises an error' do
+        expect do
+          Person.send(method_name, :members)
+        end.to raise_error(expected_error)
+      end
+    end
+
+    context 'when providing one association' do
+      let!(:user) do
+        User.create!(posts: [ post1 ])
+      end
+
+      let!(:post1) do
+        Post.create!
+      end
+
+      let(:result) do
+        User.send(method_name, :posts).first
+      end
+
+      it 'executes the query' do
+        expect(result).to eq(user)
+      end
+
+      it 'includes the related objects' do
+        expect(result.posts).to eq([ post1 ])
+      end
+    end
+
+    context 'when providing a list of associations' do
+      let!(:user) do
+        User.create!(posts: [ post1 ], descriptions: [ description1 ])
+      end
+
+      let!(:post1) do
+        Post.create!
+      end
+
+      let!(:description1) do
+        Description.create!(details: 1)
+      end
+
+      let(:result) do
+        User.send(method_name, :posts, :descriptions).first
+      end
+
+      it 'executes the query' do
+        expect(result).to eq(user)
+      end
+
+      it 'includes the related objects' do
+        expect(result.posts).to eq([ post1 ])
+        expect(result.descriptions).to eq([ description1 ])
+      end
+    end
+
+    context 'when providing a nested association' do
+      let!(:user) do
+        User.create!
+      end
+      let(:result) do
+        User.send(method_name, posts: [ :alerts ]).first
+      end
+
+      before do
+        p = Post.create!(alerts: [ Alert.create! ])
+        user.posts = [ p ]
+        user.save!
+      end
+
+      it 'executes the query' do
+        expect(result).to eq(user)
+      end
+
+      it 'includes the related objects' do
+        expect(result.posts.size).to eq(1)
+        expect(result.posts.first.alerts.size).to eq(1)
+      end
+    end
+
+    context 'when providing a deeply nested association' do
+      let!(:user) do
+        User.create!
+      end
+
+      let(:results) do
+        User.send(method_name, posts: [ { alerts: :items } ]).to_a
+      end
+
+      it 'executes the query' do
+        expect(results.first).to eq(user)
+      end
+    end
+
+    context 'when the models are inherited' do
+      before(:all) do
+        class A
+          include Mongoid::Document
+        end
+
+        class B < A
+          belongs_to :c
+        end
+
+        class C
+          include Mongoid::Document
+
+          has_one :b
+        end
+      end
+
+      after(:all) do
+        Object.send(:remove_const, :A)
+        Object.send(:remove_const, :B)
+        Object.send(:remove_const, :C)
+      end
+
+      context 'when the includes is on the subclass' do
+        let!(:c_one) do
+          C.create!
+        end
+
+        let!(:c_two) do
+          C.create!
+        end
+
+        let!(:b) do
+          B.create!(c: c_two)
+        end
+
+        let!(:results) do
+          C.send(method_name, :b).to_a.detect do |c|
+            c.id == c_two.id
+          end
+        end
+
+        it 'returns the correct documents' do
+          expect(results).to eq(c_two)
+        end
+
+        it 'does not query the db' do
+          expect_query(0) do
+            results.b
+          end
+        end
+      end
+    end
+
+    context 'when the models are inherited from another one model' do
+      context 'when the relation is a has_one' do
+        before(:all) do
+          class A
+            include Mongoid::Document
+          end
+
+          class B < A
+            belongs_to :d
+          end
+
+          class C < A
+            belongs_to :d
+          end
+
+          class D
+            include Mongoid::Document
+
+            has_one :b
+            has_one :c
+          end
+        end
+
+        after(:all) do
+          Object.send(:remove_const, :A)
+          Object.send(:remove_const, :B)
+          Object.send(:remove_const, :C)
+          Object.send(:remove_const, :D)
+        end
+
+        context 'when the includes is on the several relations' do
+          let!(:d_one) do
+            D.create!
+          end
+
+          let!(:d_two) do
+            D.create!
+          end
+
+          let!(:b) do
+            B.create!(d: d_two)
+          end
+
+          let!(:c) do
+            C.create!(d: d_two)
+          end
+
+          let!(:results) do
+            query = -> { D.send(method_name, :b, :c).entries.detect { |d| d.id == d_two.id } }
+            (method_name == :eager_load) ? expect_query(1, &query) : query.call
+          end
+
+          it 'returns the correct documents' do
+            expect(results).to eq(d_two)
+          end
+
+          it 'does not query the db on b' do
+            expect_query(0) do
+              results.b
+            end
+          end
+
+          it 'does not query the db on c' do
+            expect_query(0) do
+              results.c
+            end
+          end
+        end
+      end
+
+      context 'when the relation is a has_many' do
+        before(:all) do
+          class A
+            include Mongoid::Document
+          end
+
+          class B < A
+            belongs_to :d
+          end
+
+          class C < A
+            belongs_to :d
+          end
+
+          class D
+            include Mongoid::Document
+
+            has_many :b
+            has_many :c
+          end
+        end
+
+        after(:all) do
+          Object.send(:remove_const, :A)
+          Object.send(:remove_const, :B)
+          Object.send(:remove_const, :C)
+          Object.send(:remove_const, :D)
+        end
+
+        context 'when the includes is on the several relations' do
+          let!(:d_one) do
+            D.create!
+          end
+
+          let!(:d_two) do
+            D.create!
+          end
+
+          let!(:bs) do
+            2.times.map { B.create!(d: d_two) }
+          end
+
+          let!(:cs) do
+            2.times.map { C.create!(d: d_two) }
+          end
+
+          let!(:results) do
+            query = -> { D.send(method_name, :b, :c).entries.detect { |d| d.id == d_two.id } }
+            (method_name == :eager_load) ? expect_query(1, &query) : query.call
+          end
+
+          it 'returns the correct documents' do
+            expect(results).to eq(d_two)
+          end
+
+          it 'does not query the db on b' do
+            expect_query(0) do
+              results.b
+            end
+          end
+
+          it 'does not query the db on c' do
+            expect_query(0) do
+              results.c
+            end
+          end
+        end
+      end
+    end
+
+    context 'when including the same association multiple times' do
+      let(:criteria) do
+        Person.all.send(method_name, :posts, :posts).send(method_name, :posts)
+      end
+
+      let(:association) do
+        Person.reflect_on_association(:posts)
+      end
+
+      it 'does not duplicate the association in the inclusions' do
+        expect(criteria.inclusions).to eq([ association ])
+      end
+    end
+
+    context 'when mapping the results more than once' do
+      let!(:post) do
+        person.posts.create!(title: 'one')
+      end
+
+      let(:criteria) do
+        Post.send(method_name, :person)
+      end
+
+      let!(:results) do
+        criteria.map { |doc| doc }
+        criteria.map { |doc| doc }
+      end
+
+      it 'returns the proper results' do
+        expect(results.first.title).to eq('one')
+      end
+    end
+
+    context 'when including a belongs to relation' do
+      context 'when the criteria is from the root' do
+        let!(:person_two) do
+          Person.create!(age: 2)
+        end
+
+        let!(:post_one) do
+          person.posts.create!(title: 'one')
+        end
+
+        let!(:post_two) do
+          person_two.posts.create!(title: 'two')
+        end
+
+        context 'when calling first' do
+          let(:criteria) do
+            Post.send(method_name, :person)
+          end
+
+          let!(:document) do
+            query = -> { criteria.first }
+            (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+          end
+
+          it 'eager loads the first document' do
+            expect_query(0) do
+              expect(document.person).to eq(person)
+            end
+          end
+
+          it 'returns the first document' do
+            expect(document).to eq(post_one)
+          end
+        end
+
+        context 'when calling last' do
+          let!(:criteria) do
+            Post.asc(:_id).send(method_name, :person)
+          end
+
+          let!(:document) do
+            criteria.last
+          end
+
+          it 'eager loads the last document' do
+            expect_query(0) do
+              expect(document.person).to eq(person_two)
+            end
+          end
+
+          it 'returns the last document' do
+            expect(document).to eq(post_two)
+          end
+        end
+      end
+
+      context 'when the criteria is from an embedded relation' do
+        let(:peep) do
+          Person.create!
+        end
+
+        let!(:address_one) do
+          peep.addresses.create!(street: 'rosenthaler')
+        end
+
+        let!(:address_two) do
+          peep.addresses.create!(street: 'weinmeister')
+        end
+
+        let!(:depeche) do
+          Band.create!(name: 'Depeche Mode')
+        end
+
+        let!(:tool) do
+          Band.create!(name: 'Tool')
+        end
+
+        before do
+          address_one.band = depeche
+          address_two.band = tool
+          address_one.save!
+          address_two.save!
+        end
+
+        context 'when calling first' do
+          let(:criteria) do
+            peep.reload.addresses.send(method_name, :band)
+          end
+
+          let(:context) do
+            criteria.context
+          end
+
+          let!(:document) do
+            # Since this is called on an embedded criteria, we will be using the includes path
+            # rather than the $lookup path, so we do not need to check queries.
+            criteria.first
+          end
+
+          it 'eager loads the first document' do
+            expect_query(0) do
+              expect(document.band).to eq(depeche)
+            end
+          end
+
+          it 'returns the document' do
+            expect(document).to eq(address_one)
+          end
+        end
+
+        context 'when calling last' do
+          let(:criteria) do
+            peep.reload.addresses.send(method_name, :band)
+          end
+
+          let(:context) do
+            criteria.context
+          end
+
+          let!(:document) do
+            query = -> { criteria.last }
+            (method_name == :eager_load) ? expect_query(2, &query) : query.call
+          end
+
+          it 'eager loads the last document' do
+            expect_query(0) do
+              expect(document.band).to eq(tool)
+            end
+          end
+
+          it 'returns the document' do
+            expect(document).to eq(address_two)
+          end
+        end
+
+        context 'when iterating all documents' do
+          let(:criteria) do
+            peep.reload.addresses.send(method_name, :band)
+          end
+
+          let(:context) do
+            criteria.context
+          end
+
+          let!(:documents) do
+            query = -> { criteria.to_a }
+            (method_name == :eager_load) ? expect_query(2, &query) : query.call
+          end
+
+          it 'eager loads the first document' do
+            expect_query(0) do
+              expect(documents.first.band).to eq(depeche)
+            end
+          end
+
+          it 'eager loads the last document' do
+            expect_query(0) do
+              expect(documents.last.band).to eq(tool)
+            end
+          end
+
+          it 'returns the documents' do
+            expect(documents).to eq([ address_one, address_two ])
+          end
+        end
+      end
+    end
+
+    context 'when providing inclusions to the default scope' do
+      before do
+        Person.default_scope(-> { Person.send(method_name, :posts) })
+      end
+
+      after do
+        Person.default_scoping = nil
+      end
+
+      let!(:post_one) do
+        person.posts.create!(title: 'one')
+      end
+
+      let!(:post_two) do
+        person.posts.create!(title: 'two')
+      end
+
+      context 'when the criteria has no options' do
+        let!(:criteria) do
+          Person.asc(:age).all
+        end
+
+        let!(:documents) do
+          query = -> { criteria.entries }
+          (method_name == :eager_load) ? expect_less_than_queries(2, &query) : query.call
+        end
+
+        it 'returns the correct documents' do
+          expect(documents).to eq([ person ])
+        end
+
+        it 'eager loads the first document' do
+          expect_query(0) do
+            expect(documents.first.posts.first).to eq(post_one)
+          end
+        end
+
+        it 'eager loads the last document' do
+          expect_query(0) do
+            expect(documents.first.posts.last).to eq(post_two)
+          end
+        end
+
+        context 'when executing the query twice' do
+          let(:new_criteria) { Person.where(id: person.id) }
+          let(:from_db) { new_criteria.first }
+          let(:new_context) { new_criteria.context }
+
+          before do
+            if method_name == :eager_load
+              expect(new_context).to receive(:eager_load_with_lookup).once.and_call_original
+            else
+              expect(new_context).to receive(:eager_load).with([ person ]).once.and_call_original
+            end
+
+            from_db
+          end
+
+          it 'does not duplicate documents in the relation' do
+            expect(person.posts.size).to eq(2)
+          end
+        end
+      end
+
+      context 'when calling first on the criteria' do
+        let(:criteria) do
+          Person.asc(:age).all
+        end
+
+        let!(:from_db) do
+          criteria.first
+        end
+
+        it 'returns the correct documents' do
+          expect(from_db).to eq(person)
+        end
+
+        it 'eager loads the first document' do
+          expect_query(0) do
+            expect(from_db.posts.first).to eq(post_one)
+          end
+        end
+
+        it 'eager loads the last document' do
+          expect_query(0) do
+            expect(from_db.posts.last).to eq(post_two)
+          end
+        end
+      end
+
+      context 'when calling last on the criteria' do
+        let(:criteria) { Person.asc(:age).all }
+        let(:from_db) { criteria.last }
+        let(:context) { criteria.context }
+
+        before do
+          if method_name == :eager_load
+            expect(context).to receive(:eager_load_with_lookup).once.and_call_original
+          else
+            expect(context).to receive(:eager_load).with([ person ]).once.and_call_original
+          end
+
+          from_db
+        end
+
+        it 'returns the correct documents' do
+          expect(from_db).to eq(person)
+        end
+
+        it 'eager loads the first document' do
+          expect_query(0) do
+            expect(from_db.posts.first).to eq(post_one)
+          end
+        end
+
+        it 'eager loads the last document' do
+          expect_query(0) do
+            expect(from_db.posts.last).to eq(post_two)
+          end
+        end
+      end
+
+      context 'when the criteria has limiting options' do
+        let!(:person_two) do
+          Person.create!
+        end
+
+        let!(:post_three) do
+          person_two.posts.create!(title: 'three')
+        end
+
+        let!(:criteria) do
+          Person.asc(:age).limit(1)
+        end
+
+        let!(:documents) do
+          query = -> { criteria.entries }
+          (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+        end
+
+        it 'returns the correct documents' do
+          expect(criteria).to eq([ person ])
+        end
+
+        it 'eager loads the first document' do
+          expect_query(0) do
+            expect(documents.first.posts.first).to eq(post_one)
+          end
+        end
+
+        it 'eager loads the second document' do
+          expect_query(0) do
+            expect(documents.first.posts.last).to eq(post_two)
+          end
+        end
+      end
+    end
+
+    context 'when including a has and belongs to many' do
+      let!(:preference_one) do
+        person.preferences.create!(name: 'one')
+      end
+
+      let!(:preference_two) do
+        person.preferences.create!(name: 'two')
+      end
+
+      context 'when one of the related items is deleted' do
+        before do
+          person.preferences = [ preference_one, preference_two ]
+          preference_two.delete
+        end
+
+        let(:criteria) do
+          Person.where(id: person.id).send(method_name, :preferences)
+        end
+
+        it 'only loads the existing related items' do
+          expect(criteria.entries.first.preferences).to eq([ preference_one ])
+        end
+      end
+
+      context 'when the criteria has no options' do
+        let!(:criteria) do
+          Person.asc(:age).send(method_name, :preferences)
+        end
+
+        let!(:documents) do
+          query = -> { criteria.entries }
+          (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+        end
+
+        it 'returns the correct documents' do
+          expect(documents).to eq([ person ])
+        end
+
+        it 'eager loads the first document' do
+          expect_query(0) do
+            expect(documents.first.preferences.first).to eq(preference_one)
+          end
+        end
+
+        it 'eager loads the last document' do
+          expect_query(0) do
+            expect(documents.first.preferences.last).to eq(preference_two)
+          end
+        end
+      end
+
+      context 'when calling first on the criteria' do
+        let!(:criteria) do
+          Person.asc(:age).send(method_name, :preferences)
+        end
+
+        # here
+        let!(:from_db) do
+          query = -> { criteria.first }
+          (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+        end
+
+        it 'returns the correct documents' do
+          expect(from_db).to eq(person)
+        end
+
+        it 'eager loads the first document' do
+          expect_query(0) do
+            expect(from_db.preferences.first).to eq(preference_one)
+          end
+        end
+
+        it 'eager loads the last document' do
+          expect_query(0) do
+            expect(from_db.preferences.last).to eq(preference_two)
+          end
+        end
+      end
+
+      context 'when calling last on the criteria' do
+        let!(:criteria) do
+          Person.asc(:age).send(method_name, :preferences)
+        end
+
+        let!(:from_db) do
+          query = -> { criteria.last }
+          (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+        end
+
+        it 'returns the correct documents' do
+          expect(from_db).to eq(person)
+        end
+
+        it 'eager loads the first document' do
+          expect_query(0) do
+            expect(from_db.preferences.first).to eq(preference_one)
+          end
+        end
+
+        it 'eager loads the last document' do
+          expect_query(0) do
+            expect(from_db.preferences.last).to eq(preference_two)
+          end
+        end
+      end
+    end
+
+    context 'when including a has many' do
+      let!(:post_one) do
+        person.posts.create!(title: 'one')
+      end
+
+      let!(:post_two) do
+        person.posts.create!(title: 'two')
+      end
+
+      context 'when the criteria has no options' do
+        let!(:criteria) do
+          Person.asc(:age).send(method_name, :posts)
+        end
+
+        let!(:documents) do
+          query = -> { criteria.entries }
+          (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+        end
+
+        it 'returns the correct documents' do
+          expect(documents).to eq([ person ])
+        end
+
+        it 'eager loads the first document' do
+          expect_query(0) do
+            expect(documents.first.posts.first).to eq(post_one)
+          end
+        end
+
+        it 'eager loads the last document' do
+          expect_query(0) do
+            expect(documents.first.posts.last).to eq(post_two)
+          end
+        end
+      end
+
+      context 'when calling first on the criteria' do
+        let!(:criteria) do
+          Person.asc(:age).send(method_name, :posts)
+        end
+
+        let!(:from_db) do
+          criteria.first
+        end
+
+        it 'returns the correct documents' do
+          expect(from_db).to eq(person)
+        end
+
+        context 'when subsequently getting all documents' do
+          let!(:documents) do
+            criteria.entries
+          end
+
+          it 'returns the correct documents' do
+            expect(documents).to eq([ person ])
+          end
+        end
+      end
+
+      context 'when calling last on the criteria' do
+        let!(:criteria) do
+          Person.asc(:age).send(method_name, :posts)
+        end
+
+        let!(:from_db) do
+          criteria.last
+        end
+
+        it 'returns the correct documents' do
+          expect(from_db).to eq(person)
+        end
+
+        context 'when subsequently getting all documents' do
+          let!(:documents) do
+            criteria.entries
+          end
+
+          it 'returns the correct documents' do
+            expect(documents).to eq([ person ])
+          end
+        end
+      end
+
+      context 'when the criteria has limiting options' do
+        let(:person_two) do
+          Person.create!
+        end
+
+        let(:documents) do
+          criteria.entries
+        end
+
+        let(:post_three) do
+          person_two.posts.create!(title: 'three')
+        end
+
+        let(:criteria) do
+          Person.send(method_name, :posts).asc(:age).limit(1)
+        end
+
+        let(:context) do
+          criteria.context
+        end
+
+        before do
+          post_three
+
+          if method_name == :includes
+            expect(context).to receive(:eager_load).with([ person ]).once.and_call_original
+          else
+            expect(context).to receive(:eager_load_with_lookup).once.and_call_original
+          end
+        end
+
+        it 'returns the correct documents' do
+          expect(documents).to eq([ person ])
+        end
+      end
+    end
+
+    context 'when including a has one' do
+      let!(:game_one) do
+        person.create_game(name: 'one')
+      end
+
+      let!(:game_two) do
+        person.create_game(name: 'two')
+      end
+
+      context 'when the criteria has no options' do
+        let(:criteria) do
+          Person.asc(:age).send(method_name, :game)
+        end
+
+        let(:documents) do
+          criteria.entries
+        end
+
+        let(:context) do
+          criteria.context
+        end
+
+        before do
+          if method_name == :includes
+            expect(context).to receive(:eager_load).with([ person ]).once.and_call_original
+          else
+            expect(context).to receive(:eager_load_with_lookup).once.and_call_original
+          end
+        end
+
+        it 'returns the correct documents' do
+          expect(documents).to eq([ person ])
+        end
+      end
+
+      context 'when the criteria has limiting options' do
+        let(:person_two) do
+          Person.create!(age: 2)
+        end
+
+        let(:documents) do
+          criteria.entries
+        end
+
+        let(:game_three) do
+          person_two.create_game(name: 'Skyrim')
+        end
+
+        let(:criteria) do
+          Person.where(id: person.id).send(method_name, :game).asc(:age).limit(1)
+        end
+
+        let(:context) do
+          criteria.context
+        end
+
+        before do
+          person_two
+          game_three
+
+          if method_name == :includes
+            expect(context).to receive(:eager_load).with([ person ]).once.and_call_original
+          else
+            expect(context).to receive(:eager_load_with_lookup).once.and_call_original
+          end
+        end
+
+        it 'returns the correct documents' do
+          expect(documents).to eq([ person ])
+        end
+      end
+    end
+
+    context 'when including a belongs to' do
+      let(:person_two) do
+        Person.create!(age: 2)
+      end
+
+      let!(:game_one) do
+        person.create_game(name: 'one')
+      end
+
+      let!(:game_two) do
+        person_two.create_game(name: 'two')
+      end
+
+      context 'when providing no options' do
+        let(:criteria) do
+          Game.send(method_name, :person)
+        end
+
+        let(:documents) do
+          criteria.entries
+        end
+
+        let(:context) do
+          criteria.context
+        end
+
+        before do
+          if method_name == :includes
+            expect(context).to receive(:preload).twice.and_call_original
+          else
+            expect(context).to receive(:preload_for_lookup).twice.and_call_original
+          end
+
+          documents
+        end
+
+        it 'returns the correct documents' do
+          expect(criteria).to eq([ game_one, game_two ])
+        end
+      end
+
+      context 'when the criteria has limiting options' do
+        let(:criteria) do
+          Game.where(id: game_one.id).send(method_name, :person).asc(:_id).limit(1)
+        end
+
+        let(:documents) do
+          criteria.entries
+        end
+
+        let(:context) do
+          criteria.context
+        end
+
+        before do
+          if method_name == :includes
+            expect(context).to receive(:eager_load).with([ game_one ]).once.and_call_original
+          else
+            expect(context).to receive(:eager_load_with_lookup).once.and_call_original
+          end
+
+          documents
+        end
+
+        it 'returns the correct documents' do
+          expect(documents).to eq([ game_one ])
+        end
+      end
+    end
+
+    context 'when including multiples in the same criteria' do
+      let(:documents) { criteria.entries }
+      let(:post_one) { person.posts.create!(title: 'one') }
+      let(:post_two) { person.posts.create!(title: 'two') }
+      let(:game_one) { person.create_game(name: 'one') }
+      let(:game_two) { person.create_game(name: 'two') }
+      let(:criteria) { Person.send(method_name, :posts, :game).asc(:age) }
+      let(:context) { criteria.context }
+
+      before do
+        post_one
+        post_two
+        game_one
+        game_two
+
+        if method_name == :includes
+          expect(context).to receive(:preload).twice.and_call_original
+        else
+          expect(context).to receive(:preload_for_lookup).twice.and_call_original
+        end
+
+        documents
+      end
+
+      it 'returns the correct documents' do
+        expect(criteria).to eq([ person ])
+      end
+    end
+
+    context 'when classes inherit from each other' do
+      let!(:admin) do
+        IncAdmin.create!(admin_level: 2)
+      end
+
+      let!(:post) do
+        admin.posts.create!
+      end
+
+      let(:criteria) do
+        IncUser.send(method_name, :posts)
+      end
+
+      let!(:documents) do
+        query = -> { criteria.entries }
+        (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+      end
+
+      it 'returns the correct documents' do
+        expect(documents).to eq([ admin ])
+      end
+
+      it 'eager loads the posts' do
+        expect_query(0) do
+          expect(documents.first.posts).to eq([ post ])
+        end
+      end
+    end
+
+    context 'when including nested referenced associations' do
+      context 'when using a has_one association' do
+        before(:all) do
+          class A
+            include Mongoid::Document
+
+            has_one :b
+          end
+
+          class B
+            include Mongoid::Document
+
+            belongs_to :a
+            has_one :c
+          end
+
+          class C
+            include Mongoid::Document
+
+            belongs_to :b
+            has_one :d
+          end
+
+          class D
+            include Mongoid::Document
+
+            belongs_to :c
+          end
+        end
+
+        after(:all) do
+          Object.send(:remove_const, :A)
+          Object.send(:remove_const, :B)
+          Object.send(:remove_const, :C)
+          Object.send(:remove_const, :D)
+        end
+
+        let!(:a) do
+          A.create!
+        end
+
+        let!(:b) do
+          B.create!
+        end
+
+        let!(:c) do
+          C.create!
+        end
+
+        let!(:d) do
+          D.create!
+        end
+
+        before do
+          c.d = d
+          b.c = c
+          a.b = b
+        end
+
+        context 'when including the belongs_to association' do
+          let!(:result) do
+            C.send(method_name, b: :a).first
+          end
+
+          it 'finds the right document' do
+            expect(result).to eq(c)
+            expect(result.b).to eq(c.b)
+            expect(result.b.a).to eq(c.b.a)
+          end
+
+          it 'does not execute a query' do
+            expect_query(0) do
+              result.b.a
+            end
+          end
+        end
+
+        context 'when including a doubly-nested belongs_to association' do
+          let!(:result) do
+            query = -> { D.send(method_name, c: { b: :a }).first }
+            (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+          end
+
+          it 'finds the right document' do
+            expect(result).to eq(d)
+            expect(result.c).to eq(d.c)
+            expect(result.c.b).to eq(d.c.b)
+            expect(result.c.b.a).to eq(d.c.b.a)
+          end
+
+          it 'does not execute a query' do
+            expect_query(0) do
+              result.c.b.a
+            end
+          end
+        end
+
+        context 'when including the has_many association' do
+          let!(:result) do
+            query = -> { A.send(method_name, b: :c).first }
+            (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+          end
+
+          it 'finds the right document' do
+            expect(result).to eq(a)
+            expect(result.b).to eq(a.b)
+            expect(result.b.c).to eq(a.b.c)
+          end
+
+          it 'does not executes a query' do
+            expect_query(0) do
+              result.b.c
+            end
+          end
+        end
+
+        context 'when including a doubly-nested has_many association' do
+          let!(:result) do
+            query = -> { A.send(method_name, b: { c: :d }).first }
+            (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+          end
+
+          it 'finds the right document' do
+            expect(result).to eq(a)
+            expect(result.b).to eq(a.b)
+            expect(result.b.c).to eq(a.b.c)
+            expect(result.b.c.d).to eq(a.b.c.d)
+          end
+
+          it 'does not execute a query' do
+            expect_query(0) do
+              result.b.c.d
+            end
+          end
+        end
+
+        context 'when there are multiple documents' do
+          let!(:as) do
+            res = 9.times.map do |_i|
+              A.create!.tap do |a|
+                a.b = B.create!.tap do |b|
+                  b.c = C.create!
+                end
+              end
+            end
+            [ a, *res ]
+          end
+
+          let!(:results) do
+            query = -> { A.send(method_name, b: :c).entries.sort }
+            (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+          end
+
+          it 'finds the right document' do
+            as.length.times do |i|
+              expect(as[i]).to eq(results[i])
+              expect(as[i].b).to eq(results[i].b)
+              expect(as[i].b.c).to eq(results[i].b.c)
+            end
+          end
+
+          it 'does not execute a query' do
+            expect_query(0) do
+              results.each do |a|
+                a.b.c
+              end
+            end
+          end
+        end
+
+        context 'when there are multiple associations' do
+          before(:all) do
+            class A
+              has_one :c
+            end
+
+            class C
+              belongs_to :a
+            end
+          end
+
+          let(:c2) { C.create! }
+          let(:d2) { D.create! }
+
+          let(:results) do
+            query = -> { A.send(method_name, b: { c: :d }, c: :d).first }
+            (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+          end
+
+          before do
+            a.c = c2
+            a.c.d = d2
+            results
+          end
+
+          it 'finds the right document' do
+            expect(results).to eq(a)
+            expect(results.b).to eq(a.b)
+            expect(results.b.c).to eq(a.b.c)
+            expect(results.b.c.d).to eq(a.b.c.d)
+            expect(results.c).to eq(a.c)
+            expect(results.c.d).to eq(a.c.d)
+          end
+
+          it 'does not execute a query' do
+            expect_query(0) do
+              results.c.d
+              results.b.c.d
+            end
+          end
+        end
+      end
+    end
+
+    context 'when using a has_many association with an empty association' do
+      let!(:user) do
+        IncUser.create!
+      end
+
+      let!(:result) do
+        IncUser.send(method_name, :posts, :comments).where(id: user.id).first
+      end
+
+      it 'executes the query' do
+        expect(result).to eq(user)
+      end
+
+      it 'does not issue extra queries' do
+        expect_query(0) do
+          result.posts.to_a
+          result.comments.to_a
+        end
+      end
+    end
+
+    context 'when using a has_many association' do
+      let!(:user) do
+        IncUser.create!(posts: posts, comments: user_comments)
+      end
+
+      let!(:posts) do
+        [ IncPost.create!(comments: post_comments) ]
+      end
+
+      let!(:user_comments) do
+        2.times.map { IncComment.create! }
+      end
+
+      let!(:post_comments) do
+        2.times.map { IncComment.create! }
+      end
+
+      context 'when including the same class twice' do
+        let!(:results) do
+          query = -> { IncPost.send(method_name, { user: :comments }, :comments).entries.sort }
+          (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+        end
+
+        it 'finds the right documents' do
+          posts.length.times do |i|
+            expect(posts[i]).to eq(results[i])
+            expect(posts[i].user).to eq(results[i].user)
+            expect(posts[i].user.comments).to eq(results[i].user.comments)
+            expect(posts[i].comments).to eq(results[i].comments)
+          end
+        end
+
+        it 'does not execute a query' do
+          expect_query(0) do
+            results.each do |res|
+              res.user
+              res.user.comments.to_a
+              res.comments.to_a
+            end
+          end
+        end
+      end
+
+      context 'when the association chain has a class name twice' do
+        let!(:thread) { IncThread.create!(comments: user_comments) }
+
+        let!(:result) do
+          query = -> { IncThread.send(method_name, comments: { user: { posts: :comments } }).first }
+          (method_name == :eager_load) ? expect_less_than_queries(3, &query) : query.call
+        end
+
+        it 'finds the right document' do
+          expect(result).to eq(thread)
+          result.comments.length.times do |i|
+            c1 = result.comments[i]
+            c2 = thread.comments[i]
+            expect(c1).to eq(c2)
+            expect(c1.user).to eq(c2.user)
+            c1.user.posts.length.times do |i|
+              p1 = c1.user.posts[i]
+              p2 = c2.user.posts[i]
+
+              expect(p1).to eq(p2)
+              expect(p1.comments).to eq(p2.comments)
+            end
+          end
+        end
+
+        it 'does not execute a query' do
+          expect_query(0) do
+            result.comments.each do |comment|
+              comment.user.posts.each do |post|
+                post.comments.to_a
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  describe '#includes' do
+    it_behaves_like 'eager loading', :includes
+  end
+
+  describe '#eager_load' do
+    # 4.4 lookup does not support the lookup pipeline as it is currently written
+    min_server_version '5.0'
+    it_behaves_like 'eager loading', :eager_load
+  end
+
+  describe '#inclusions' do
+    let(:criteria) do
+      Band.includes(:records)
+    end
+
+    let(:association) do
+      Band.relations['records']
+    end
+
+    it 'returns the inclusions' do
+      expect(criteria.inclusions).to eq([ association ])
+    end
+  end
+
+  describe '#inclusions=' do
+    let(:criteria) do
+      Band.all
+    end
+
+    let(:association) do
+      Band.relations['records']
+    end
+
+    before do
+      criteria.inclusions = [ association ]
+    end
+
+    it 'sets the inclusions' do
+      expect(criteria.inclusions).to eq([ association ])
+    end
+  end
+
+  context 'When multiple associations reference the same class' do
+    before do
+      IncBlog.create(
+        posts: [
+          IncBlogPost.create(author: IncAuthor.create),
+          IncBlogPost.create(author: IncAuthor.create),
+          IncBlogPost.create(author: IncAuthor.create)
+        ],
+        highlighted_post: IncBlogPost.create(author: IncAuthor.create)
+      )
+    end
+
+    let!(:result) do
+      IncBlog.includes(:posts, highlighted_post: :author).first
+    end
+
+    it 'does not execute a query' do
+      expect_query(0) do
+        result.posts.to_a
+        result.highlighted_post
+      end
+    end
+
+    it 'executes a query for the non-retrieved elements' do
+      expect_query(3) do
+        result.posts.each do |post|
+          post.author
+        end
+      end
+    end
+  end
+
+  context 'When multiple parent_inclusions for the same association' do
+    before do
+      IncBlog.create(
+        posts: [
+          IncBlogPost.create(author: IncAuthor.create),
+          IncBlogPost.create(author: IncAuthor.create),
+          IncBlogPost.create(author: IncAuthor.create)
+        ],
+        highlighted_post: IncBlogPost.create(author: IncAuthor.create),
+        pinned_post: IncBlogPost.create(author: IncAuthor.create)
+      )
+    end
+
+    let!(:result) do
+      IncBlog.includes(:posts, highlighted_post: :author, pinned_post: :author).first
+    end
+
+    it 'does not execute a query' do
+      expect_query(0) do
+        result.posts.to_a
+        result.highlighted_post
+        result.pinned_post
+      end
+    end
+
+    it 'executes a query for the non-retrieved elements' do
+      expect_query(3) do
+        result.posts.each do |post|
+          post.author
+        end
+      end
+    end
+
+    context 'when including an association and using each twice on a criteria' do
+      let(:criteria) { IncPost.all.includes(:person) }
+
+      before do
+        p = IncPerson.create!(name: 'name')
+        4.times { IncPost.create!(person: p) }
+        criteria
+        expect_query(2) do
+          criteria.each(&:person)
+        end
+      end
+
+      # The reason we are checking for two operations here is:
+      #   - The first operation gets all of the posts
+      #   - The second operation gets the person from the first post
+      # Now, all subsequent posts should use the eager loaded person when
+      # trying to retrieve their person.
+      # MONGOID-3942 reported that after iterating the criteria a second time,
+      # the posts would not get the eager loaded person.
+      it 'eager loads the criteria' do
+        expect_query(2) do
+          criteria.each(&:person)
+        end
+      end
+    end
+  end
+end
